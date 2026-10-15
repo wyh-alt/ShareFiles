@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# ---- PyInstaller 打包产物 ----
+build/
+dist/
+*.manifest
+# 注意：ShareFiles.spec 是要提交的 —— 它是打包配置（含体积优化），
+# 不是构建产物，删了就得重写那套排除逻辑。
+!ShareFiles.spec
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- 系统 ----
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---- 运行时 / 调试产物 ----
+*.log
