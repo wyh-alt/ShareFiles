@@ -296,7 +296,7 @@ class DownloadTask:
 
     __slots__ = ("ip", "name", "url_path", "file_size", "transferred", "conns",
                  "started", "created", "updated", "completed",
-                 "_speed", "_peak", "_last_t", "_last_bytes")
+                 "_speed", "_peak", "_peak_conns", "_last_t", "_last_bytes")
 
     def __init__(self, client_ip: str, name: str, url_path: str, file_size: int):
         now = time.monotonic()
@@ -312,6 +312,7 @@ class DownloadTask:
         self.completed = False
         self._speed = 0.0
         self._peak = 0.0
+        self._peak_conns = 0
         self._last_t = now
         self._last_bytes = 0
 
@@ -343,6 +344,15 @@ class DownloadTask:
     def peak(self) -> float:
         """本次下载中出现过的最高速度（平滑后的值，与界面显示同源）。"""
         return self._peak
+
+    @property
+    def peak_conns(self) -> int:
+        """本次下载中出现过的最大并发连接数。
+
+        任务结束后 conns 归零，那一刻的实时值没有留存意义；峰值能说明
+        对方是用浏览器单连接下的，还是下载工具分段拉的。
+        """
+        return self._peak_conns
 
 
 class _Conn:
@@ -387,6 +397,8 @@ class TransferTracker:
                 task.file_size = file_size      # 文件被替换过，更新一下基准
 
             task.conns += 1
+            if task.conns > task._peak_conns:
+                task._peak_conns = task.conns
             task.updated = time.time()
             if task.conns == 1:
                 task._last_t = time.monotonic()
@@ -456,6 +468,7 @@ class TransferTracker:
                     "progress": t.progress,
                     "speed": t.speed(now) if t.conns else 0.0,
                     "peak": t.peak,
+                    "peak_conns": t.peak_conns,
                     "conns": t.conns,
                     "state": t.state,
                     "created": t.created,

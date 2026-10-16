@@ -132,9 +132,14 @@ def dot(color: str, text: str) -> str:
 
 
 def stamp(ts: float) -> str:
-    """时间戳 -> 导出用的完整时刻。时间戳离谱时给个空串，别让整张表导不出去。"""
+    """时间戳 -> 导出用的时刻，ISO 8601 的 T 分隔写法。
+
+    不用"年-月-日 时:分:秒"那种空格写法：Excel 打开 CSV 时会把它识别成日期，
+    列宽不够就整列显示成 #。带 T 的写法 Excel 按文本处理，内容完整可见。
+    时间戳离谱时给空串，别让整张表导不出去。
+    """
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
     except (ValueError, OSError):
         return ""
 
@@ -1034,7 +1039,7 @@ class SharePage(QWidget):
                 wr = csv.writer(f)
                 wr.writerow(["开始时间", "最后活动", "下载者 IP", "文件名",
                              "文件大小", "已传输", "耗时(秒)", "平均速率",
-                             "峰值速率", "状态", "连接数"])
+                             "峰值速率", "状态", "峰值连接数"])
                 for it in items:
                     # 速率 = 已传字节 / 耗时。耗时过短时无法得到可信数值：
                     # Windows 上 time.time() 精度约 15ms，小文件常在一个刻度内传完，
@@ -1053,7 +1058,7 @@ class SharePage(QWidget):
                         human_speed(avg) if avg else "—",
                         human_speed(it.get("peak", 0)) if it.get("peak") else "—",
                         states.get(it["state"], it["state"]),
-                        it["conns"],
+                        it.get("peak_conns", it["conns"]),
                     ])
         except OSError as exc:
             return str(exc)
