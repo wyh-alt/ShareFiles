@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ShareFiles —— 把文件拖进来，就能发给别人的局域网分享工具。
+"""局域网文件分享 —— 把文件拖进来，就能发给别人的局域网分享工具。
 
 界面分四块，从上到下正好是使用顺序：
     1. 分享内容  —— 拖入文件 / 文件夹
@@ -10,15 +10,18 @@
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import os
 import sys
 import time
 import urllib.parse
 
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import (QColor, QFontMetrics, QIcon, QPainter, QPen,
-                         QPixmap)
+from PyQt6.QtCore import (QEasingCurve, QEvent, QPoint, QPointF,
+                          QPropertyAnimation, QRect, QRectF, Qt, QTimer,
+                          QVariantAnimation, pyqtSignal)
+from PyQt6.QtGui import (QColor, QFontMetrics, QIcon, QPainter, QPainterPath,
+                         QPen, QPixmap, QRadialGradient, QRegion)
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog,
                              QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
@@ -38,10 +41,12 @@ from fileserver import (SecurityPolicy, ShareRegistry, TransferTracker,
                         create_server, get_lan_ips, human_size, human_speed,
                         parse_block_entry)
 
-APP_NAME = "ShareFiles"
+APP_NAME = "局域网文件分享"
 DEFAULT_PORT = 8000
 
 # 单实例用的管道名。同一台电脑上只允许跑一个，第二个会被劝退
+# 进程间标识，与界面上显示的名字无关，不跟着 APP_NAME 改名 ——
+# 改了会让新旧版本互相看不见，同时跑起两个实例
 SINGLE_INSTANCE_KEY = "ShareFiles.SingleInstance"
 
 # 下载详情里最多列出多少条历史记录（追踪器本身留得更多，只是不全画出来）
@@ -70,6 +75,14 @@ STATE_COLORS = {
     "cancelled": ("#c42b1c", "#ff99a4"),
 }
 C_STATE_FALLBACK = ("#8a8a8a", "#b0b0b0")
+
+# 球旁条幅上那个状态色点：按通知的轻重取色
+NOTICE_COLORS = {
+    "success": "#6ccb5f",
+    "info": "#4cc2ff",
+    "warning": "#fce100",
+    "error": "#ff99a4",
+}
 
 
 def state_color(state: str) -> str:
@@ -116,6 +129,14 @@ def resource_path(name: str) -> str:
 
 def dot(color: str, text: str) -> str:
     return f'<span style="color:{color};font-size:15px">●</span>&nbsp;{text}'
+
+
+def stamp(ts: float) -> str:
+    """时间戳 -> 导出用的完整时刻。时间戳离谱时给个空串，别让整张表导不出去。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except (ValueError, OSError):
+        return ""
 
 
 # --------------------------------------------------------------------------
@@ -480,6 +501,28 @@ class SettingsDialog(MessageBoxBase):
             "勾选后图片、PDF、视频将在浏览器中直接打开。")
         self.viewLayout.addWidget(self.previewCheck)
 
+        # ---------- 桌面 ----------
+        self.viewLayout.addSpacing(8)
+        self.viewLayout.addWidget(StrongBodyLabel("桌面", self))
+
+        # 这一项对应 cfg_close_action，与关窗口时的询问框写的是同一个值：
+        # 在此设定后，关窗口不再询问
+        self.closeToTrayCheck = CheckBox("关闭时隐藏窗口收进托盘", self)
+        self.closeToTrayCheck.setChecked(page.cfg_close_action == "tray")
+        self.closeToTrayCheck.setToolTip(
+            "勾选：点关闭只是把窗口收进托盘，共享继续运行、链接保持有效。\n"
+            "不勾选：关闭窗口即退出程序，停止共享、链接失效。\n"
+            "首次关闭时仍会先询问一次，可勾选记住；此处设定后不再询问。")
+        self.viewLayout.addWidget(self.closeToTrayCheck)
+
+        self.ballCheck = CheckBox("窗口隐藏后显示悬浮球", self)
+        self.ballCheck.setChecked(page.cfg_ball_enabled)
+        self.ballCheck.setToolTip(
+            "悬浮球停在屏幕边缘，文件拖上去即可加入分享。\n"
+            "鼠标移开后自动变淡，避免遮挡后面的内容；有下载时显示进度环。\n"
+            "在悬浮球上点右键可直接隐藏。")
+        self.viewLayout.addWidget(self.ballCheck)
+
         # ---------- 下载安全 ----------
         self.viewLayout.addSpacing(8)
         self.viewLayout.addWidget(StrongBodyLabel("下载安全", self))
@@ -625,6 +668,8 @@ class SettingsDialog(MessageBoxBase):
             "limit": self.limitSpin.value() if self.limitCheck.isChecked() else 0,
             # 双击改过的条目在这里统一过一遍校验，不合法的会被 set_blocked 丢掉
             "blocked": [t.strip() for t in self._blocked_entries() if t.strip()],
+            "close_action": "tray" if self.closeToTrayCheck.isChecked() else "quit",
+            "ball_enabled": self.ballCheck.isChecked(),
         }
 
 
@@ -635,18 +680,23 @@ class CloseDialog(MessageBoxBase):
     所以这里记下用户点了哪个，而不是看 exec() 的返回值。
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, ball: bool = True):
         super().__init__(parent)
 
         self.choice = None                 # "tray" / "quit" / None（关掉了对话框）
         self.remember = False
 
+        # 显式分成两行：句子长了 Qt 会把对话框撑宽去迁就，最后一个词还会被甩到下一行。
+        # 悬浮球已关闭时不提它，避免提示与实际不符
+        text = ("收进托盘后共享继续运行、链接保持有效；\n"
+                "退出则停止共享，链接随即失效。")
+        if ball:
+            text = ("收进托盘后共享继续运行、链接保持有效，桌面显示悬浮球，\n"
+                    "文件拖上去即可接着添加；退出则停止共享，链接随即失效。")
+
         self.viewLayout.setSpacing(10)
         self.viewLayout.addWidget(SubtitleLabel("关闭窗口", self))
-        # 显式分成两行：句子长了 Qt 会把对话框撑宽去迁就，最后一个词还会被甩到下一行
-        self.viewLayout.addWidget(BodyLabel(
-            "收进托盘后共享继续运行、链接保持有效；\n"
-            "退出则停止共享，链接随即失效。", self))
+        self.viewLayout.addWidget(BodyLabel(text, self))
 
         self.rememberCheck = CheckBox("记住我的选择，以后不再询问", self)
         self.viewLayout.addWidget(self.rememberCheck)
@@ -687,6 +737,10 @@ class SharePage(QWidget):
         self.cfg_port = saved["port"]
         self.cfg_preview = saved["preview"]
         self.cfg_close_action = saved["close_action"]
+        # 悬浮球上次的停靠位置；从未拖动过则为 None，由球选择默认位置
+        bx, by = saved["ball_x"], saved["ball_y"]
+        self.cfg_ball = (bx, by) if bx is not None and by is not None else None
+        self.cfg_ball_enabled = saved["ball_enabled"]
         self.policy.set_password(saved["password"])
         self.policy.set_limit(saved["limit"])
         self.policy.set_blocked(saved["blocked"])
@@ -694,6 +748,7 @@ class SharePage(QWidget):
         self._quota_snapshot = None
         self._share_count = 0
         self._known_tasks: set = set()
+        self._task_states: dict = {}     # 上次刷新时各下载任务的状态，用于发现状态迁移
         self._share_rows: dict[str, QWidget] = {}
         self._transfer_rows: dict[tuple, TransferRow] = {}
 
@@ -850,12 +905,20 @@ class SharePage(QWidget):
         self.policy.set_password(values["password"])
         self.policy.set_limit(values["limit"])
 
+        ball_was = self.cfg_ball_enabled
+        self.cfg_ball_enabled = values.get("ball_enabled", True)
+        if self.cfg_ball_enabled != ball_was:
+            self.win.sync_ball()        # 立即生效，无需等下次收进托盘
+
+        # 关闭行为在此设定后不再询问
+        self.cfg_close_action = values.get("close_action", self.cfg_close_action)
+
         # 黑名单是逐请求检查的，改完立即生效，不用重开服务
         wanted = values.get("blocked", [])
         kept = self.policy.set_blocked(wanted)
         if kept != len(wanted):
-            toast("warning", "有黑名单条目格式不对",
-                  f"{len(wanted) - kept} 条已跳过", parent=self.window())
+            toast("warning", "黑名单条目格式错误",
+                  f"已跳过 {len(wanted) - kept} 条", parent=self.window())
 
         # 开关次数限制会改变列表要显示的列，而用量本身没变、快照比对发现不了，
         # 所以这里清掉快照逼一次重建
@@ -880,6 +943,16 @@ class SharePage(QWidget):
         self.cfg_close_action = action
         self._save_config()
 
+    def set_ball_pos(self, x: int, y: int):
+        """记录悬浮球的停靠位置，下次显示时沿用。"""
+        self.cfg_ball = (x, y)
+        self._save_config()
+
+    def set_ball_enabled(self, on: bool):
+        """记录悬浮球开关状态。关闭后需到高级设置中重新开启。"""
+        self.cfg_ball_enabled = on
+        self._save_config()
+
     def _save_config(self):
         """把当前设置写回 ~/.sharefiles/config.json。"""
         ok = appconfig.save({
@@ -890,6 +963,9 @@ class SharePage(QWidget):
             "limit": self.policy.limit,
             "blocked": self.policy.blocked,
             "close_action": self.cfg_close_action,
+            "ball_x": self.cfg_ball[0] if self.cfg_ball else None,
+            "ball_y": self.cfg_ball[1] if self.cfg_ball else None,
+            "ball_enabled": self.cfg_ball_enabled,
         })
         if not ok:
             toast("warning", "设置已生效，但没能存进配置文件",
@@ -907,6 +983,11 @@ class SharePage(QWidget):
         head = QHBoxLayout()
         head.addWidget(StrongBodyLabel("下载详情", card))
         head.addStretch(1)
+
+        self.exportLogBtn = PushButton(FIF.SAVE, "导出记录", card)
+        self.exportLogBtn.setToolTip("把这次运行期间的下载记录存成 CSV 表格")
+        self.exportLogBtn.clicked.connect(self._export_log)
+        head.addWidget(self.exportLogBtn)
 
         self.clearLogBtn = PushButton(FIF.DELETE, "清空记录", card)
         self.clearLogBtn.setToolTip("移除已结束的记录，进行中的下载不受影响")
@@ -928,9 +1009,79 @@ class SharePage(QWidget):
         gone = self.tracker.clear_finished()
         self._refresh_status()
         if gone:
-            toast("success", "已清空下载记录", f"移除了 {gone} 条",
+            toast("success", "已清空下载记录", f"移除 {gone} 条",
                             duration=2200, position=InfoBarPosition.TOP_RIGHT,
                             parent=self.window())
+
+    def _log_items(self) -> list:
+        """本次运行期间的下载记录，按开始时间排序。
+
+        取自界面所用的同一份快照，进行中的任务也包含在内，
+        避免下载进行时导出的记录缺少当前条目。
+        """
+        snap = self.tracker.snapshot()
+        items = snap["active"] + snap["recent"]
+        items.sort(key=lambda x: x.get("created", 0))
+        return items
+
+    @staticmethod
+    def _write_log(path: str, items: list):
+        """写 CSV：成功返回 True，写不动返回一句错误说明。"""
+        states = {"active": "下载中", "done": "已完成", "cancelled": "已中断"}
+        try:
+            # utf-8-sig 带 BOM，Excel 直接打开时中文不会乱码
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                wr = csv.writer(f)
+                wr.writerow(["开始时间", "最后活动", "下载者 IP", "文件名",
+                             "文件大小", "已传输", "耗时(秒)", "平均速率",
+                             "峰值速率", "状态", "连接数"])
+                for it in items:
+                    # 速率 = 已传字节 / 耗时。耗时过短时无法得到可信数值：
+                    # Windows 上 time.time() 精度约 15ms，小文件常在一个刻度内传完，
+                    # 此时耗时记为 0、速率留空，而不是填一个不可靠的数字
+                    elapsed = max(0.0, it["updated"] - it["created"])
+                    quick = elapsed < 0.05
+                    avg = it["sent"] / elapsed if not quick and elapsed > 0 else 0.0
+                    wr.writerow([
+                        stamp(it["created"]),
+                        stamp(it["updated"]),
+                        it["ip"],
+                        it["name"],
+                        human_size(it["total"]).replace(" ", "") if it["total"] else "未知",
+                        human_size(it["sent"]).replace(" ", ""),
+                        "0" if quick else f"{elapsed:.1f}",
+                        human_speed(avg) if avg else "—",
+                        human_speed(it.get("peak", 0)) if it.get("peak") else "—",
+                        states.get(it["state"], it["state"]),
+                        it["conns"],
+                    ])
+        except OSError as exc:
+            return str(exc)
+        return True
+
+    def _export_log(self):
+        """把本次运行的下载记录导出为 CSV 文件。"""
+        items = self._log_items()
+        if not items:
+            self.win.notify("暂无下载记录")
+            return
+
+        default = f"{APP_NAME}下载记录_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self.window(), "导出下载记录", default, "CSV 表格 (*.csv)")
+        if not path:
+            return
+
+        result = self._write_log(path, items)
+        if result is not True:
+            box = MessageBox("导出失败", f"无法写入该文件：\n{result}", self.window())
+            box.yesButton.setText("知道了")
+            box.cancelButton.hide()
+            box.exec()
+            return
+
+        self.win.notify("已导出下载记录",
+                        f"{len(items)} 条 → {os.path.basename(path)}", "success")
 
     # -- 底部状态栏 ---------------------------------------------------------
 
@@ -983,23 +1134,25 @@ class SharePage(QWidget):
 
         self._sync_share_ui()
 
-        if failed:
+        if failed and self.win.window_usable():
             box = MessageBox(
                 "部分内容未能加入",
                 "以下路径不存在或无法读取：\n\n" + "\n".join(failed), self.window())
             box.yesButton.setText("知道了")
             box.cancelButton.hide()
             box.exec()
+        elif failed:
+            # 窗口收在托盘里（或最小化）时弹出的对话框看不见，改用通知
+            self.win.notify("部分内容未能加入",
+                            "、".join(failed[:3]) + ("…" if len(failed) > 3 else ""),
+                            "error")
         elif added:
             msg = f"已加入 {added} 项"
             if skipped:
                 msg += f"，{skipped} 项已在列表中"
-            toast("success", "添加成功", msg, duration=2400,
-                            position=InfoBarPosition.TOP_RIGHT, parent=self.window())
+            self.win.notify("添加成功", msg, "success")
         elif skipped:
-            toast("info", "已在列表中", f"这 {skipped} 项已在列表中。",
-                         duration=2400, position=InfoBarPosition.TOP_RIGHT,
-                         parent=self.window())
+            self.win.notify("已在列表中", f"跳过 {skipped} 项重复内容")
 
     def _remove_share(self, vpath: str):
         # 只是从分享列表摘掉，已经在传的下载不受影响（handler 早把文件打开
@@ -1280,8 +1433,11 @@ class SharePage(QWidget):
             self.shareStatus.setText(dot(C_OFF, "当前未共享"))
             self.shareStatus.setToolTip("")
 
-        # 托盘图标右下角的状态点跟着一起变
+        # 托盘图标右下角的状态点、桌面小球上的进度环跟着一起变
         self.win.set_tray_busy(snap["task_count"] > 0)
+        self.win.set_ball_progress(snap["active"])
+        self.win.set_ball_stats(self._ball_stats_text(snap))
+        self._watch_transfers(snap)
 
         # 下载队列
         n, conns = snap["task_count"], snap["conn_count"]
@@ -1340,6 +1496,45 @@ class SharePage(QWidget):
                 self._quota_snapshot = usage
                 self._sync_share_ui()
 
+    def _ball_stats_text(self, snap: dict) -> str:
+        """鼠标停在球上时显示的那行概况。"""
+        count = len(self.registry)
+        if not count:
+            return "当前没有分享文件"
+        return f"{count} 个分享文件 · {snap['completed']} 次下载记录"
+
+    def _watch_transfers(self, snap: dict):
+        """比对前后两次快照，就下载开始、完成、中断这三种状态迁移向用户提示。
+
+        追踪器只保留当前状态，迁移得在这里前后比对推出来。按状态而非"新任务"
+        判断，是因为本机下载可能在两次刷新之间就整个走完，只认新任务会漏掉它。
+        """
+        state_of = {}
+        for it in snap["active"] + snap["recent"]:
+            key = (it["ip"], it["url_path"])
+            state_of[key] = it
+            was = self._task_states.get(key)
+            if was == it["state"]:
+                continue                     # 状态没变，不必打扰
+            if was is None:
+                # 首次见到：若已结束，说明开始那一步发生在两次刷新之间，只报结果
+                if it["state"] == "active":
+                    self.win.notify(it["name"], f'{it["ip"]} 开始下载', "info")
+                else:
+                    self._announce(it)
+            elif it["state"] in ("done", "cancelled"):
+                self._announce(it)
+        self._task_states = {k: v["state"] for k, v in state_of.items()}
+
+    def _announce(self, it: dict):
+        """报一条下载结果。"""
+        size = human_size(it["total"]).replace(" ", "") if it["total"] else "未知"
+        if it["state"] == "done":
+            self.win.notify(it["name"], f'{it["ip"]} 下载完成 · {size}', "success")
+        else:
+            sent = human_size(it["sent"]).replace(" ", "")
+            self.win.notify(it["name"], f'{it["ip"]} 下载中断 · {sent}/{size}', "warning")
+
     # ---------------------------------------------------------------------
 
     def shutdown(self):
@@ -1347,6 +1542,655 @@ class SharePage(QWidget):
         if self.server is not None:
             self.server.stop()
             self.server = None
+
+
+# --------------------------------------------------------------------------
+# 悬浮球
+# --------------------------------------------------------------------------
+
+BALL_SIZE = 46          # 球的直径
+BALL_MARGIN = 2         # 球外留的一圈，给抗锯齿边缘留余地
+BALL_GAP = 12           # 贴边后球边离屏幕边的距离
+BALL_HOVER = 0.45       # 悬停时的亮度档（1.0 = 有文件拖在球上）
+BALL_SNAP_MS = 200      # 吸附动画时长
+BALL_DIM_MS = 100       # 鼠标移开后多久开始变淡
+BALL_DIM_ALPHA = 0.5    # 变淡后的不透明度
+BALL_FADE_MS = 420      # 变淡与恢复的过渡时长
+
+
+class BallBanner(QWidget):
+    """悬浮球旁边的一条深色提示。
+
+    三种内容共用它：悬停时的分享概况、拖文件经过球时的操作提示、
+    以及窗口不可见时的下载通知。同一时刻只显示一条，新内容替换旧内容。
+    """
+
+    closed = pyqtSignal()        # 自动淡出并收起之后
+
+    RADIUS = 8
+    PAD_H = 14
+    PAD_V = 9
+    LINE_GAP = 3
+    DOT = 8                 # 左侧状态色点的直径
+    DOT_GAP = 7             # 色点与文字的间距
+    MAX_TEXT = 210          # 单行文字的最大宽度，超出部分省略
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.ToolTip
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self._title = ""
+        self._note = ""
+        self._accent = None
+        self._alpha = 1.0
+
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(240)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.valueChanged.connect(self._set_alpha)
+        self._fade.finished.connect(self._on_faded)
+
+        # 通知条到点自己消失，不必等用户来关
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.fade_out)
+
+        self.set_message("")
+
+    # -- 内容与显示 ---------------------------------------------------------
+
+    def set_message(self, title: str, note: str = "", accent: str = None):
+        """替换内容。note 为副文本，accent 是左侧状态色点的颜色。"""
+        fm = QFontMetrics(self.font())
+        self._title = fm.elidedText(title, Qt.TextElideMode.ElideRight, self.MAX_TEXT)
+        self._note = fm.elidedText(note, Qt.TextElideMode.ElideRight, self.MAX_TEXT)
+        self._accent = accent
+        self._fit(fm)
+        self.update()
+
+    def pop(self, msec: int = 0):
+        """显示。msec 大于 0 时到点自动淡出。"""
+        self._timer.stop()
+        self._fade.stop()
+        self._alpha = 1.0
+        if msec:
+            self._timer.start(msec)
+        self.show()
+        self.raise_()
+
+    def fade_out(self):
+        self._timer.stop()
+        if not self.isVisible():
+            return
+        self._fade.stop()
+        self._fade.setStartValue(self._alpha)
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_faded(self):
+        if self._alpha <= 0.01:
+            self.hide()
+            self.closed.emit()
+
+    def _set_alpha(self, value):
+        self._alpha = float(value)
+        self.update()
+
+    def _fit(self, fm: QFontMetrics):
+        """按内容重算尺寸，并同步窗口形状。
+
+        窗口区域必须在每次改变大小后重设：它按窗口矩形计算，
+        沿用旧尺寸会把新文字裁掉（透明窗口另需此形状避免露出白底，同 FloatingBall）。
+        """
+        width = max(fm.horizontalAdvance(self._title),
+                    fm.horizontalAdvance(self._note))
+        rows = 2 if self._note else 1
+        height = fm.height() * rows + self.LINE_GAP * (rows - 1)
+        if self._accent:
+            width += self.DOT + self.DOT_GAP
+        self.resize(width + self.PAD_H * 2, height + self.PAD_V * 2)
+
+        mask = QPainterPath()
+        mask.addRoundedRect(QRectF(self.rect()), self.RADIUS, self.RADIUS)
+        self.setMask(QRegion(mask.toFillPolygon().toPolygon()))
+
+    # -- 绘制 ---------------------------------------------------------------
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(self._alpha)
+
+        # 深底浅字：背景可能是桌面、也可能是任意窗口，这个配色在深浅两种底色上都清楚
+        box = QPainterPath()
+        box.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                           self.RADIUS, self.RADIUS)
+        p.fillPath(box, QColor(32, 32, 32, 236))
+        p.setPen(QPen(QColor(255, 255, 255, 46), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(box)
+
+        left = self.PAD_H
+        if self._accent:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(self._accent))
+            p.drawEllipse(QPointF(left + self.DOT / 2, self.height() / 2),
+                          self.DOT / 2, self.DOT / 2)
+            left += self.DOT + self.DOT_GAP
+
+        fm = QFontMetrics(self.font())
+        width = self.width() - left - self.PAD_H
+        top = self.PAD_V
+        p.setPen(QColor("#f5f5f5"))
+        p.drawText(QRect(left, top, width, fm.height()),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self._title)
+        if self._note:
+            top += fm.height() + self.LINE_GAP
+            p.setPen(QColor("#b4b4b4"))
+            p.drawText(QRect(left, top, width, fm.height()),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       self._note)
+        p.end()
+
+
+class FloatingBall(QWidget):
+    """收进托盘后留在桌面上的小球：把文件拖上来即加入分享列表。
+
+    窗口与球同大，形状由窗口区域裁成圆形（球外留 BALL_MARGIN 给抗锯齿）。
+    松手后吸附到最近的屏幕边，上下左右四条边都算。
+    """
+
+    filesDropped = pyqtSignal(list)
+    activated = pyqtSignal()              # 双击：唤回主窗口
+    menuRequested = pyqtSignal(object)    # 右键：坐标交给主窗口弹菜单
+    moved = pyqtSignal(object)            # 停靠位置变了，由主窗口记入配置
+
+    def __init__(self, icon: QIcon, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAcceptDrops(True)
+        # 光标用默认箭头，只在按住拖动时换成抓取手型
+        self.setToolTip("拖文件到这里即可分享 · 双击打开窗口")
+        self.setFixedSize(BALL_SIZE + BALL_MARGIN * 2, BALL_SIZE + BALL_MARGIN * 2)
+
+        self._icon = icon
+        self._hot = False            # 有文件正拖在球上
+        self._hover = False          # 鼠标停在球上
+        self._level = 0.0            # 亮度档：0 静息 → BALL_HOVER 悬停 → 1 拖入
+        self._alpha = 1.0            # 整体不透明度，闲置时降到 BALL_DIM_ALPHA
+        self._progress = None        # 进行中下载的总进度，None = 无下载
+        self._stats = ""             # 悬停时展示的分享概况，由主窗口喂
+        self._press = None           # 按下时的（鼠标全局位置，窗口位置）
+        self._moving = False
+        self._banner = None          # 球旁的提示条，用到时才建
+
+        self._apply_round_window()
+        self._drop_system_frame()
+
+        # 吸附时滑动过去，而不是瞬移
+        self._snapAnim = QPropertyAnimation(self, b"pos", self)
+        self._snapAnim.setDuration(BALL_SNAP_MS)
+        self._snapAnim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # 悬停、拖入的亮度变化
+        self._glowAnim = QVariantAnimation(self)
+        self._glowAnim.setDuration(140)
+        self._glowAnim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._glowAnim.valueChanged.connect(self._set_level)
+        # 闲置变淡：球长期停在屏幕边上，不淡会遮挡后面的内容
+        self._fadeAnim = QVariantAnimation(self)
+        self._fadeAnim.setDuration(BALL_FADE_MS)
+        self._fadeAnim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fadeAnim.valueChanged.connect(self._set_alpha)
+        self._dimTimer = QTimer(self)
+        self._dimTimer.setSingleShot(True)
+        self._dimTimer.setInterval(BALL_DIM_MS)
+        self._dimTimer.timeout.connect(lambda: self._fade_to(BALL_DIM_ALPHA))
+
+    # -- 淡入淡出 -----------------------------------------------------------
+
+    def _set_alpha(self, value):
+        self._alpha = float(value)
+        self.update()
+
+    def set_progress(self, fraction=None):
+        """设置进度环，fraction 为总进度（0~1），None 表示无人下载。"""
+        if fraction == self._progress:
+            return                   # 状态栏每 400ms 问一次，值没变不必重绘
+        self._progress = fraction
+        self.update()
+
+    def _fade_to(self, alpha: float):
+        """调整整球的不透明度。
+
+        降低的是绘制透明度，而非 setWindowOpacity：后者在这种自带 alpha 的
+        无边框窗口上不生效（Qt 只记录数值，不作用于窗口或内容），
+        自绘透明度与球边的抗锯齿走同一条 alpha 路径，行为一致。
+        """
+        if abs(self._alpha - alpha) < 0.01:
+            return
+        self._fadeAnim.stop()
+        self._fadeAnim.setStartValue(self._alpha)
+        self._fadeAnim.setEndValue(alpha)
+        self._fadeAnim.start()
+
+    def _wake(self, idle_again: bool = True):
+        """恢复不透明。idle_again 为真时重新开始计闲置时间。"""
+        self._dimTimer.stop()
+        self._fade_to(1.0)
+        if idle_again:
+            self._dimTimer.start()
+
+    # -- 窗口形状 -----------------------------------------------------------
+
+    def _apply_round_window(self):
+        """把窗口裁成圆形。
+
+        透明窗口的球外区域依赖系统合成才透明，合成不生效时会显示为白底。
+        用窗口区域定义形状不依赖合成，任何环境下都不会出现白边。
+        """
+        self.setMask(QRegion(0, 0, self.width(), self.height(),
+                             QRegion.RegionType.Ellipse))
+
+    def _drop_system_frame(self):
+        """关闭 Windows 为顶层窗口绘制的系统外观。
+
+        Win11 会给顶层窗口描边框、加圆角并铺一层背景，在普通窗口上无妨，
+        在这种透明小球上则表现为球周围的一个白色方框。
+        """
+        try:
+            dwm = ctypes.windll.dwmapi
+            # 不声明参数类型的话，64 位下的窗口句柄会被当 32 位整数截断
+            dwm.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                  ctypes.c_void_p, ctypes.c_uint]
+            dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+            hwnd = int(self.winId())
+
+            def set_attr(attr_id: int, value: int):
+                v = ctypes.c_uint(value)
+                dwm.DwmSetWindowAttribute(hwnd, attr_id, ctypes.byref(v),
+                                          ctypes.sizeof(v))
+
+            set_attr(2, 1)              # DWMWA_NCRENDERING_POLICY = DISABLED
+            set_attr(33, 1)             # DWMWA_WINDOW_CORNER_PREFERENCE = DONOTROUND
+            set_attr(34, 0xFFFFFFFE)    # DWMWA_BORDER_COLOR = 无色
+            set_attr(38, 1)             # DWMWA_SYSTEMBACKDROP_TYPE = 不铺背景
+        except (AttributeError, OSError):
+            pass                     # 老系统上没有这几个属性，没有就没有
+
+    # -- 摆放 ---------------------------------------------------------------
+
+    def place(self, pos=None):
+        """摆到指定位置；未指定则用屏幕右侧垂直居中的默认位。"""
+        if pos is None:
+            area = QApplication.primaryScreen().availableGeometry()
+            pos = (area.right() - BALL_GAP - BALL_SIZE - BALL_MARGIN,
+                   area.top() + (area.height() - BALL_SIZE) // 2 - BALL_MARGIN)
+        self.snap_to_edge(QPoint(int(pos[0]), int(pos[1])))
+
+    def snap_to_edge(self, pos=None, animate=False):
+        """吸附到最近的屏幕边（上下左右四条都算）。animate 为真时滑动过去。"""
+        pos = QPoint(self.pos()) if pos is None else QPoint(pos)
+        area = self._screen_area(pos)
+        cx, cy = pos.x() + self.width() / 2, pos.y() + self.height() / 2
+
+        # 球边距屏幕边 BALL_GAP。窗口比球大 BALL_MARGIN：靠屏幕内侧的边
+        # （左、上）减去它，靠外侧的边（右、下）加上它。
+        lo_x = area.left() + BALL_GAP - BALL_MARGIN
+        hi_x = area.right() - BALL_GAP - BALL_SIZE - BALL_MARGIN
+        lo_y = area.top() + BALL_GAP - BALL_MARGIN
+        hi_y = area.bottom() - BALL_GAP - BALL_SIZE - BALL_MARGIN
+
+        def clamp(v, lo, hi):
+            # 屏幕比球还窄时（正常不会发生）至少保证球在可见范围内
+            return max(lo, min(hi, v)) if hi > lo else lo
+
+        dist = {"left": cx - area.left(), "right": area.right() - cx,
+                "top": cy - area.top(), "bottom": area.bottom() - cy}
+        edge = min(dist, key=dist.get)
+        if edge == "left":
+            target = QPoint(lo_x, clamp(pos.y(), lo_y, hi_y))
+        elif edge == "right":
+            target = QPoint(hi_x, clamp(pos.y(), lo_y, hi_y))
+        else:
+            x = clamp(pos.x(), lo_x, hi_x)
+            target = QPoint(x, lo_y if edge == "top" else hi_y)
+
+        if target == pos:
+            return
+        if animate and self.isVisible():
+            self._snapAnim.stop()
+            self._snapAnim.setStartValue(pos)
+            self._snapAnim.setEndValue(target)
+            self._snapAnim.start()
+        else:
+            self.move(target)
+        self.moved.emit(target)
+
+    def _screen_area(self, pos) -> QRect:
+        """取窗口中心所在屏幕的可用区域。"""
+        center = QPoint(pos.x() + self.width() // 2, pos.y() + self.height() // 2)
+        screen = QApplication.screenAt(center) or QApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # 换了显示器或改了分辨率后，上次记录的位置可能已在屏幕外
+        self.snap_to_edge(self.pos())
+        # 窗口若被系统重建，DWM 属性会丢失，显示前重新设置一次
+        self._drop_system_frame()
+        self._wake()                 # 显示时先保持不透明
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._set_hot(False)
+        self._set_hover(False)
+        if self._banner is not None:
+            self._banner.hide()      # 通知条不经上面两步，得单独收
+        # 复位为不透明，下次显示时直接是清晰状态
+        self._dimTimer.stop()
+        self._fadeAnim.stop()
+        self._set_alpha(1.0)
+
+    # -- 外观 ---------------------------------------------------------------
+
+    def enterEvent(self, e):
+        self._set_hover(True)
+        self._wake(idle_again=False)     # 鼠标在球上，暂不计闲置
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._set_hover(False)
+        self._wake()
+        super().leaveEvent(e)
+
+    def _set_hover(self, on: bool):
+        if on == self._hover:
+            return
+        self._hover = on
+        self._glow_to()
+        self._refresh_banner()
+
+    def _set_hot(self, on: bool):
+        if on == self._hot:
+            return
+        self._hot = on
+        self._glow_to()
+        self._refresh_banner()
+
+    def _glow_to(self):
+        """平滑过渡到当前的亮度档。"""
+        target = 1.0 if self._hot else (BALL_HOVER if self._hover else 0.0)
+        if not self.isVisible():
+            self._set_level(target)          # 未显示时不必过渡
+            return
+        self._glowAnim.stop()
+        self._glowAnim.setStartValue(self._level)
+        self._glowAnim.setEndValue(target)
+        self._glowAnim.start()
+
+    def _set_level(self, value):
+        self._level = float(value)
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.setOpacity(self._alpha)    # 闲置时整体变淡
+
+        center = QPointF(self.width() / 2, self.height() / 2)
+        r = BALL_SIZE / 2
+        # 明暗都在圆内绘制，否则渐变会溢出到球外
+        p.save()
+        clip = QPainterPath()
+        clip.addEllipse(center, r, r)
+        p.setClipPath(clip)
+        self._paint_sphere(p, center, r)
+        p.restore()
+
+        # 浅色描边，在浅色桌面上也能分辨球的边界
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 96), 1.2))
+        p.drawEllipse(center, r - 0.6, r - 0.6)
+
+        if self._progress is not None:
+            self._paint_progress(p, center, r)
+        p.end()
+
+    def _paint_progress(self, p, c: QPointF, r: float):
+        """在球内侧绘制一圈进度环。
+
+        Qt 角度单位为 1/16 度，0 度位于三点钟方向、逆时针为正；
+        从十二点顺时针增长需取起点 90 度、步长为负。
+        """
+        ring = QRectF(c.x() - r + 2.2, c.y() - r + 2.2,
+                      (r - 2.2) * 2, (r - 2.2) * 2)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        # 先铺一圈暗槽，否则绿色弧线压在球面亮部会看不清
+        p.setPen(QPen(QColor(0, 0, 0, 76), 3))
+        p.drawEllipse(ring)
+        p.setPen(QPen(QColor("#6ccb5f"), 3, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap))
+        # 刚开始也留一小段，表示确实有下载在进行
+        span = max(0.02, min(1.0, self._progress))
+        p.drawArc(ring, 90 * 16, int(-360 * 16 * span))
+
+    def _paint_sphere(self, p, c: QPointF, r: float):
+        """把图标画成球：右下收暗、左上提亮，顶部一块镜面反光。
+
+        亮度随 `_level` 变化（悬停、拖入时更亮）。
+        """
+        lv = self._level
+        # 底色：用程序图标铺满圆，中间仍是上传箭头
+        side = int(round(r * 2))
+        pm = self._icon.pixmap(side, side)
+        p.drawPixmap(QRectF(c.x() - r, c.y() - r, r * 2, r * 2), pm,
+                     QRectF(pm.rect()))
+
+        p.setPen(Qt.PenStyle.NoPen)
+
+        # 右下收暗 —— 光从左上来
+        dark = QRadialGradient(QPointF(c.x() + r * 0.42, c.y() + r * 0.50), r * 1.5)
+        dark.setColorAt(0.0, QColor(0, 26, 60, 96))
+        dark.setColorAt(0.55, QColor(0, 26, 60, 34))
+        dark.setColorAt(1.0, QColor(0, 26, 60, 0))
+        p.setBrush(dark)
+        p.drawEllipse(c, r, r)
+
+        # 左上提亮
+        light = QRadialGradient(QPointF(c.x() - r * 0.34, c.y() - r * 0.40), r * 1.3)
+        light.setColorAt(0.0, QColor(255, 255, 255, int(104 + 74 * lv)))
+        light.setColorAt(0.6, QColor(255, 255, 255, int(22 + 30 * lv)))
+        light.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(light)
+        p.drawEllipse(c, r, r)
+
+        # 顶部的小块高光，是球面感的关键；过大就成了蒙在球上的一层雾
+        spot = QPointF(c.x() - r * 0.10, c.y() - r * 0.54)
+        spec = QRadialGradient(spot, r * 0.62)
+        spec.setColorAt(0.0, QColor(255, 255, 255, int(168 + 62 * lv)))
+        spec.setColorAt(0.55, QColor(255, 255, 255, int(60 + 40 * lv)))
+        spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setBrush(spec)
+        p.drawEllipse(spot, r * 0.48, r * 0.27)
+
+        # 底边的环境反光，避免球看起来像贴在桌面上的平面圆片
+        rim = QPointF(c.x(), c.y() + r * 0.70)
+        bounce = QRadialGradient(rim, r * 0.85)
+        bounce.setColorAt(0.0, QColor(190, 230, 255, 78))
+        bounce.setColorAt(1.0, QColor(190, 230, 255, 0))
+        p.setBrush(bounce)
+        p.drawEllipse(rim, r * 0.70, r * 0.42)
+
+        # 内圈发光：悬停和拖入时的状态提示
+        if lv > 0.01:
+            glow = QRadialGradient(c, r)
+            glow.setColorAt(0.0, QColor(160, 225, 255, 0))
+            glow.setColorAt(0.68, QColor(160, 225, 255, 0))
+            glow.setColorAt(1.0, QColor(175, 232, 255, int(126 * lv)))
+            p.setBrush(glow)
+            p.drawEllipse(c, r, r)
+
+    # -- 拖放 ---------------------------------------------------------------
+
+    def dragEnterEvent(self, e):
+        if self._local_files(e):
+            e.acceptProposedAction()
+            # 拖放期间 Qt 不发送 enterEvent，需在此恢复不透明
+            self._wake(idle_again=False)
+            self._set_hot(True)
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._set_hot(False)
+        self._wake()
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        # 先收提示再发信号：_add_paths 可能弹出对话框，气泡留着会与对话框重叠
+        self._set_hot(False)
+        paths = self._local_files(e)
+        if paths:
+            e.acceptProposedAction()
+            self.filesDropped.emit(paths)
+        # 拖放期间不触发 enterEvent，须在此重启闲置计时；若松手时鼠标仍在球上则暂不计
+        self._wake(idle_again=not self.rect().contains(e.position().toPoint()))
+
+    @staticmethod
+    def _local_files(e) -> list:
+        if not e.mimeData().hasUrls():
+            return []
+        return [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+
+    # -- 鼠标 ---------------------------------------------------------------
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(e)
+        self._snapAnim.stop()        # 若上一段滑动未结束，此处接管
+        self._wake(idle_again=False)  # 可能正处于变淡状态，先恢复再拖
+        self._press = (e.globalPosition().toPoint(), self.pos())
+        self._moving = False
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._press is None:
+            return
+        grabbed_at, was_at = self._press
+        delta = e.globalPosition().toPoint() - grabbed_at
+        # 位移小于系统拖拽阈值时不算拖动，否则单击很难触发
+        if not self._moving and delta.manhattanLength() < QApplication.startDragDistance():
+            return
+        self._moving = True
+        self.move(was_at + delta)
+
+    def mouseReleaseEvent(self, e):
+        if self._press is None:
+            return super().mouseReleaseEvent(e)
+        moved, self._press = self._moving, None
+        self._moving = False
+        self.unsetCursor()           # 松开后恢复默认箭头
+        if moved:
+            self.snap_to_edge(animate=True)
+        # 鼠标仍在球上时不启动闲置计时
+        self._wake(idle_again=not self._hover)
+
+    def mouseDoubleClickEvent(self, e):
+        """双击唤回主窗口。
+
+        单击不绑定动作：悬浮球停在屏幕边缘，误触概率高。双击的第一次按下与松开
+        仍会走上面的流程，但那里已不触发动作，仅此事件生效。
+        """
+        if e.button() != Qt.MouseButton.LeftButton:
+            return super().mouseDoubleClickEvent(e)
+        e.accept()
+        self.activated.emit()
+
+    def contextMenuEvent(self, e):
+        self.menuRequested.emit(e.globalPos())
+
+    # -- 球旁条幅 -----------------------------------------------------------
+
+    def _banner_widget(self) -> BallBanner:
+        if self._banner is None:
+            self._banner = BallBanner()
+            # 通知淡出后，鼠标若还停在球上，概况该接着显示
+            self._banner.closed.connect(self._refresh_banner)
+        return self._banner
+
+    def set_stats(self, text: str):
+        """设置悬停时展示的分享概况。"""
+        if text == self._stats:
+            return
+        self._stats = text
+        if self._hover and not self._hot:
+            self._refresh_banner()
+
+    def _refresh_banner(self):
+        """决定球旁此刻该显示什么。
+
+        优先级：拖放中的操作提示 > 鼠标停在球上的分享概况。
+        通知由 show_notice 直接占据条幅，淡出后回到这里重新评估。
+        """
+        if self._hot:
+            self._show_banner("拖到此处松手即可分享")
+        elif self._hover and self._stats:
+            self._show_banner(self._stats)
+        elif self._banner is not None:
+            self._banner.hide()
+
+    def _show_banner(self, text: str):
+        banner = self._banner_widget()
+        banner.set_message(text)
+        banner.move(self._banner_pos())
+        banner.pop()
+
+    def show_notice(self, title: str, note: str = "", accent: str = None,
+                    msec: int = 5000):
+        """在球旁显示一条临时通知，到点自动消失。
+
+        拖着文件时球旁的位置正被操作提示占着，此时不显示 —— 那条提示是
+        当下正在进行的交互，比一条事后可查的通知更要紧。
+        """
+        if self._hot or not self.isVisible():
+            return
+        banner = self._banner_widget()
+        banner.set_message(title, note, accent)
+        banner.move(self._banner_pos())
+        banner.pop(msec)
+
+    def _banner_pos(self) -> QPoint:
+        """条幅排在球的外侧：球贴左边则向右展开，贴右边则向左，避免遮挡球。"""
+        area = self._screen_area(self.pos())
+        banner = self._banner
+        gap, geo = 10, self.geometry()
+        ball_left = geo.x() + BALL_MARGIN
+        cx = geo.center().x()
+        if cx - area.left() <= area.right() - cx:
+            x = ball_left + BALL_SIZE + gap          # 球靠左，条幅在右侧
+        else:
+            x = ball_left - gap - banner.width()     # 球靠右，条幅在左侧
+        y = geo.center().y() - banner.height() // 2
+        y = max(area.top() + 6, min(y, area.bottom() - banner.height() - 6))
+        return QPoint(int(x), int(y))
 
 
 # --------------------------------------------------------------------------
@@ -1382,6 +2226,9 @@ class MainWindow(QMainWindow):
                   avail.y() + max(0, (avail.height() - h) // 2))
 
         self._tray = self._build_tray(icon_path)
+        self._ball = None            # 悬浮球，第一次收进托盘时才建
+        self._ball_stats = ""        # 球还没建时先攒着，建好一并交给它
+        self._tray_hinted = False    # "已收进托盘"的提示每次运行只说一遍
 
         # 守着单实例的管道：第二个实例启动时会来敲门，我们负责把窗口亮出来
         self._ipc = QLocalServer(self)
@@ -1442,12 +2289,33 @@ class MainWindow(QMainWindow):
 
         d = size * 0.36
         m = size * 0.09
-        # 描边要够重：浅色点亮时它紧挨着图标里那个白箭头，描边浅了就糊成一坨
+        # 描边需足够重：它紧挨着图标中的白色箭头，过浅会与箭头混在一起
         p.setPen(QPen(QColor(20, 20, 20, 140), max(1.5, size * 0.055)))
         p.setBrush(QColor("#6ccb5f") if busy else QColor("#ffffff"))
         p.drawEllipse(QRectF(size - d - m, size - d - m, d, d))
         p.end()
         return QIcon(pm)
+
+    def set_ball_stats(self, text: str):
+        """把分享概况交给球，悬停时展示。球还没建时先记着，建好即生效。"""
+        self._ball_stats = text
+        if self._ball is not None:
+            self._ball.set_stats(text)
+
+    def set_ball_progress(self, active: list):
+        """把进行中的下载折算成一个总进度，供球绘制进度环。
+
+        多个任务按字节数合计：球上只有一圈，逐条显示不下。
+        """
+        if self._ball is None:
+            return
+        known = [it for it in active if it["total"] > 0]
+        if not known:
+            self._ball.set_progress(0.0 if active else None)
+            return
+        total = sum(it["total"] for it in known)
+        sent = sum(it["sent"] for it in known)
+        self._ball.set_progress(min(1.0, sent / total) if total else 0.0)
 
     def set_tray_busy(self, busy: bool):
         """切换托盘图标的状态点。只在状态真的变了时才重设。"""
@@ -1460,10 +2328,46 @@ class MainWindow(QMainWindow):
 
     # -- 托盘 ---------------------------------------------------------------
 
+    def notify(self, title: str, content: str = "", level: str = "info"):
+        """向用户发一条提示。
+
+        窗口正常显示时用界面通知条；窗口最小化或收进托盘时它不可见，
+        改用系统通知，并在悬浮球旁展开一条临时条幅。
+        """
+        if self.window_usable():
+            toast(level, title, content, duration=2600,
+                  position=InfoBarPosition.TOP_RIGHT, parent=self)
+            return
+
+        icon = {"success": QSystemTrayIcon.MessageIcon.Information,
+                "info": QSystemTrayIcon.MessageIcon.Information,
+                "warning": QSystemTrayIcon.MessageIcon.Warning,
+                "error": QSystemTrayIcon.MessageIcon.Critical,
+                }.get(level, QSystemTrayIcon.MessageIcon.Information)
+        if self._tray is not None:
+            self._tray.showMessage(title, content, icon, 4000)
+        if self._ball is not None and self._ball.isVisible():
+            self._ball.show_notice(title, content, NOTICE_COLORS.get(level))
+
     def _restore_from_tray(self):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        self._sync_ball_visibility()
+
+    def changeEvent(self, e):
+        """最小化 / 还原时同步悬浮球：窗口在屏幕上时不需要球。"""
+        super().changeEvent(e)
+        if e.type() == QEvent.Type.WindowStateChange:
+            self._sync_ball_visibility()
+
+    def _sync_ball_visibility(self):
+        """窗口可用时收起球，最小化或收进托盘时显示球。"""
+        if self.window_usable():
+            if self._ball is not None:
+                self._ball.hide()
+        else:
+            self._show_ball()
 
     def _on_tray_clicked(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
@@ -1473,59 +2377,168 @@ class MainWindow(QMainWindow):
         if self._do_quit():
             QApplication.quit()
 
+    # -- 悬浮球 -------------------------------------------------------------
+
+    def _show_ball(self):
+        """在桌面上显示悬浮球。
+
+        球只在窗口不可用时出现（收进托盘或最小化）：窗口开着时界面本身
+        就有拖放区，球只会遮挡桌面。
+        """
+        if not self.page.cfg_ball_enabled:
+            return                   # 该开关已关闭
+        if self._ball is None:
+            icon_path = resource_path("icon.ico")
+            icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+            # 不设 parent：否则主窗口 hide 时它会被一并隐藏
+            self._ball = FloatingBall(icon)
+            self._ball.filesDropped.connect(self.page._add_paths)
+            self._ball.activated.connect(self._restore_from_tray)
+            self._ball.menuRequested.connect(self._ball_menu)
+            self._ball.moved.connect(self._remember_ball)
+            self._ball.set_stats(self._ball_stats)
+
+        self._ball.place(self.page.cfg_ball)
+        self._ball.show()
+
+    def _remember_ball(self, pos):
+        self.page.set_ball_pos(pos.x(), pos.y())
+
+    def _build_ball_menu(self) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("打开主窗口", self._restore_from_tray)
+        menu.addAction("隐藏悬浮球", self._hide_ball)
+        menu.addSeparator()
+        menu.addAction("退出", self._quit_from_tray)
+        return menu
+
+    def _ball_menu(self, pos):
+        self._build_ball_menu().exec(pos)
+
+    def _hide_ball(self):
+        """隐藏悬浮球并关闭该开关，再次启用需到高级设置里打开。"""
+        self.page.set_ball_enabled(False)
+        if self._ball is not None:
+            self._ball.hide()
+        if self._tray is not None:
+            self._tray.showMessage(
+                APP_NAME, "悬浮球已隐藏。可在「高级设置 → 桌面」中重新开启。",
+                QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    def sync_ball(self):
+        """按当前开关状态同步悬浮球的显示。"""
+        if not self.page.cfg_ball_enabled and self._ball is not None:
+            self._ball.hide()
+            return
+        self._sync_ball_visibility()
+
     # -- 关闭与退出 ---------------------------------------------------------
 
     def _resolve_close_action(self):
-        """决定这次关窗口干什么。没记住过就先问一次。"""
+        """决定这次关窗口干什么，以及是不是为此问过用户。
+
+        没记住过就先问一次。返回的第二个值是"刚问过没有"，供退出环节判断
+        还需不需要再确认一遍要不要停止共享 —— 那个询问框只在没记住选择时出现。
+        """
         if self._tray is None:
-            return "quit"                # 没托盘就没什么可选的
+            return "quit", False         # 没托盘就没什么可选的
         saved = self.page.cfg_close_action
         if saved in ("tray", "quit"):
-            return saved
+            return saved, False          # 早已定下，这次没问
 
-        dlg = CloseDialog(self)
+        dlg = CloseDialog(self, self.page.cfg_ball_enabled)
         dlg.exec()
         if dlg.choice is None:
-            return None                  # 直接把对话框关掉了 = 什么都不做
+            return None, True            # 直接把对话框关掉了 = 什么都不做
         if dlg.remember:
             self.page.set_close_action(dlg.choice)
-        return dlg.choice
+        return dlg.choice, True
 
-    def _do_quit(self) -> bool:
-        """退出流程。有下载在跑时先问过用户，返回是否真的退出。"""
+    def window_usable(self) -> bool:
+        """窗口此刻是否正常显示 —— 收进托盘或最小化都算不可用。
+
+        最小化时 isVisible() 仍为真，仅凭它判断会误认为窗口还在屏幕上。
+        """
+        return self.isVisible() and not self.isMinimized()
+
+    def ask(self, title: str, content: str, yes: str, no: str) -> bool:
+        """询问用户，返回是否选择了肯定项。
+
+        窗口正常显示时用应用内对话框；窗口最小化或收进托盘时改用系统对话框 ——
+        前者是覆盖在父窗口上的一层遮罩，父窗口不可见时它同样不可见：
+        用户看不到对话框，程序却停在等待输入的状态。
+        """
+        if self.window_usable():
+            box = MessageBox(title, content, self)
+            box.yesButton.setText(yes)
+            box.cancelButton.setText(no)
+            return bool(box.exec())
+
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(title)
+        box.setInformativeText(content)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        box.button(QMessageBox.StandardButton.Yes).setText(yes)
+        box.button(QMessageBox.StandardButton.No).setText(no)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _do_quit(self, confirm_shares: bool = True) -> bool:
+        """退出流程。返回是否真的退出。
+
+        有下载在跑时提示最重的一条（会中断传输）；没有下载但有分享内容时
+        再问一句要不要停止共享。confirm_shares 为假则跳过后者 —— 关窗口那条
+        路上已经问过"收进托盘还是退出"，不必连着问两遍。
+        """
         snap = self.page.tracker.snapshot()
+        shares = len(self.page.registry)
+
         if snap["task_count"]:
             names = "、".join(it["name"] for it in snap["active"][:3])
             more = "…" if snap["task_count"] > 3 else ""
-            box = MessageBox(
-                "仍有下载进行中",
-                f"当前有 {snap['task_count']} 个下载任务正在进行（{names}{more}）。\n\n"
-                "退出将中断这些下载，接收方需重新下载。\n"
-                "确定要退出吗？", self)
-            box.yesButton.setText("仍然退出")
-            box.cancelButton.setText("继续共享")
-            if not box.exec():
+            if not self.ask(
+                    "仍有下载进行中",
+                    f"当前有 {snap['task_count']} 个下载任务正在进行（{names}{more}）。\n\n"
+                    "退出将中断这些下载，接收方需重新下载。\n"
+                    "确定要退出吗？", "仍然退出", "继续共享"):
+                return False
+        elif shares and confirm_shares:
+            if not self.ask(
+                    "停止共享",
+                    f"分享列表中还有 {shares} 项内容，退出后这些链接将立即失效。\n\n"
+                    "确定要退出吗？", "仍然退出", "继续共享"):
                 return False
 
         self.page.shutdown()
+        if self._ball is not None:
+            self._ball.hide()
         if self._tray is not None:
             self._tray.hide()
         return True
 
     def closeEvent(self, e):
-        action = self._resolve_close_action()
+        action, asked = self._resolve_close_action()
 
         if action == "tray":
-            # 隐藏到托盘：服务照跑，对方还能接着下
+            # 隐藏到托盘：服务继续运行，同时在桌面显示悬浮球
             e.ignore()
             self.hide()
-            if self._tray is not None:
+            self._sync_ball_visibility()
+            # 每次运行只提示第一次收进托盘，重复提示不含新信息
+            if self._tray is not None and not self._tray_hinted:
+                self._tray_hinted = True
                 self._tray.showMessage(
-                    APP_NAME, "仍在后台共享中，双击托盘图标可以回到窗口。",
+                    APP_NAME,
+                    "共享继续运行。文件可拖至桌面悬浮球添加，双击托盘图标返回窗口。",
                     QSystemTrayIcon.MessageIcon.Information, 3000)
             return
 
-        if action == "quit" and self._do_quit():
+        # 刚才的询问框已经交代过"退出会停止共享"时就不重复问了；
+        # 关闭行为是先前定下的（这次没弹框）则要问一句
+        if action == "quit" and self._do_quit(confirm_shares=not asked):
             e.accept()
             return
 
@@ -1554,7 +2567,7 @@ def hand_off_to_running() -> bool:
     box = QMessageBox()
     box.setWindowTitle("程序已在运行")
     box.setIcon(QMessageBox.Icon.Information)
-    box.setText("ShareFiles 已在本机运行。")
+    box.setText(f"{APP_NAME} 已在本机运行。")
     box.setInformativeText(
         "重复启动会占用同一端口，故不再开启新实例。\n已切换到正在运行的窗口。")
     box.setStandardButtons(QMessageBox.StandardButton.Ok)

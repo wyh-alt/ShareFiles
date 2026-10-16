@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ShareFiles —— 基于 Python 标准库 http.server 的局域网文件分享服务。
+"""局域网文件分享 —— 基于 Python 标准库 http.server 的文件分享服务。
 
 这个模块只做一件事：把本机任意位置的文件 / 文件夹，变成一条可以直接发给
 别人的 HTTP 下载地址，并如实记录谁正在下载、下到哪儿了。
@@ -45,6 +45,10 @@ __all__ = [
     "human_size",
     "human_speed",
 ]
+
+# 网页上显示的站点名。只能用在 HTML 里：HTTP 响应头由标准库按 latin-1 严格编码，
+# 中文放进去会直接抛 UnicodeEncodeError，所以 server_version 与 Basic realm 保持 ASCII
+SITE_NAME = "局域网文件分享"
 
 # 预览模式下发这些类型时，浏览器会就地打开而不是下载
 _PREVIEW_PREFIXES = ("image/", "video/", "audio/", "text/")
@@ -292,7 +296,7 @@ class DownloadTask:
 
     __slots__ = ("ip", "name", "url_path", "file_size", "transferred", "conns",
                  "started", "created", "updated", "completed",
-                 "_speed", "_last_t", "_last_bytes")
+                 "_speed", "_peak", "_last_t", "_last_bytes")
 
     def __init__(self, client_ip: str, name: str, url_path: str, file_size: int):
         now = time.monotonic()
@@ -307,6 +311,7 @@ class DownloadTask:
         self.updated = time.time()      # 墙钟时间，显示"什么时候结束的"
         self.completed = False
         self._speed = 0.0
+        self._peak = 0.0
         self._last_t = now
         self._last_bytes = 0
 
@@ -330,7 +335,14 @@ class DownloadTask:
             self._speed = inst if self._speed <= 0 else self._speed * 0.55 + inst * 0.45
             self._last_t = now
             self._last_bytes = self.transferred
+            if self._speed > self._peak:
+                self._peak = self._speed
         return self._speed
+
+    @property
+    def peak(self) -> float:
+        """本次下载中出现过的最高速度（平滑后的值，与界面显示同源）。"""
+        return self._peak
 
 
 class _Conn:
@@ -443,6 +455,7 @@ class TransferTracker:
                     "sent": sent,
                     "progress": t.progress,
                     "speed": t.speed(now) if t.conns else 0.0,
+                    "peak": t.peak,
                     "conns": t.conns,
                     "state": t.state,
                     "created": t.created,
@@ -681,7 +694,7 @@ def _render_page(title: str, body: str) -> str:
         f"<title>{html.escape(title)}</title>\n"
         f"<style>{_PAGE_CSS}</style>\n</head>\n<body>\n<div class=\"wrap\">\n"
         f"{body}\n"
-        "<div class=\"foot\">由 ShareFiles 提供 · 基于 Python http.server</div>\n"
+        f'<div class="foot">由 {SITE_NAME} 提供 · 基于 Python http.server</div>\n'
         "</div>\n</body>\n</html>\n"
     )
 
@@ -992,7 +1005,7 @@ class ShareHandler(SimpleHTTPRequestHandler):
         if not items:
             body = ('<h1>尚未分享任何内容</h1>'
                     '<div class="card"><div class="empty">分享者尚未添加文件。</div></div>')
-            return self._write_html(200, _render_page("ShareFiles", body))
+            return self._write_html(200, _render_page(SITE_NAME, body))
 
         rows = []
         for it in items:

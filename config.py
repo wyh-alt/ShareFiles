@@ -25,6 +25,9 @@ DEFAULTS = {
     "limit": 0,          # 每个文件的下载次数上限，0 = 不限
     "blocked": [],       # IP / 网段黑名单
     "close_action": "",  # 关窗口时干什么："" = 每次问，"tray" = 收进托盘，"quit" = 退出
+    "ball_x": None,      # 悬浮球停靠位置（屏幕坐标），None = 未拖动过，用默认位置
+    "ball_y": None,
+    "ball_enabled": True,   # 收进托盘后是否在桌面显示悬浮球
 }
 
 
@@ -59,6 +62,19 @@ def _clean(raw) -> dict:
     # 只认这两个值，别的一律当"没记住"，下次接着问
     if raw.get("close_action") in ("tray", "quit"):
         cfg["close_action"] = raw["close_action"]
+
+    # 悬浮球坐标：两个都必须是整数才有效，缺一个即视为未记录
+    for axis in ("ball_x", "ball_y"):
+        value = raw.get(axis)
+        # bool 是 int 的子类，需先排除，否则 True 会被当作合法坐标 1
+        if isinstance(value, int) and not isinstance(value, bool):
+            cfg[axis] = value
+
+    if cfg["ball_x"] is None or cfg["ball_y"] is None:
+        cfg["ball_x"] = cfg["ball_y"] = None
+
+    if "ball_enabled" in raw:
+        cfg["ball_enabled"] = bool(raw["ball_enabled"])
 
     return cfg
 
